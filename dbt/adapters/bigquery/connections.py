@@ -99,6 +99,9 @@ class BigQueryCredentials(Credentials):
     priority: Optional[Priority] = None
     maximum_bytes_billed: Optional[int] = None
     impersonate_service_account: Optional[str] = None
+    connect_retries: int = 3
+    retry_all: bool = False
+    retry_timeout: int = 5
 
     job_retry_deadline_seconds: Optional[int] = None
     job_retries: Optional[int] = 1
@@ -171,6 +174,59 @@ class BigQueryCredentials(Credentials):
             d["execution_project"] = d["database"]
         return d
 
+    def get_bigquery_credentials(self):
+        method = self.method
+        creds = GoogleServiceAccountCredentials.Credentials
+
+        if method == BigQueryConnectionMethod.OAUTH:
+            credentials, _ = get_bigquery_defaults(scopes=self.scopes)
+            return credentials
+
+        elif method == BigQueryConnectionMethod.SERVICE_ACCOUNT:
+            keyfile = self.keyfile
+            return creds.from_service_account_file(keyfile, scopes=self.scopes)
+
+        elif method == BigQueryConnectionMethod.SERVICE_ACCOUNT_JSON:
+            details = self.keyfile_json
+            return creds.from_service_account_info(details, scopes=self.scopes)
+
+        elif method == BigQueryConnectionMethod.OAUTH_SECRETS:
+            return GoogleCredentials.Credentials(
+                token=self.token,
+                refresh_token=self.refresh_token,
+                client_id=self.client_id,
+                client_secret=self.client_secret,
+                token_uri=self.token_uri,
+                scopes=self.scopes,
+            )
+
+        error = 'Invalid `method` in profile: "{}"'.format(method)
+        raise FailedToConnectException(error)
+
+    def get_impersonated_bigquery_credentials(self):
+        source_credentials = self.get_bigquery_credentials()
+        return impersonated_credentials.Credentials(
+            source_credentials=source_credentials,
+            target_principal=self.impersonate_service_account,
+            target_scopes=list(self.scopes),
+            lifetime=(self.job_execution_timeout_seconds or 300),
+        )
+
+    def acquire_handle(self):
+        if self.impersonate_service_account:
+            creds = self.get_impersonated_bigquery_credentials()
+        else:
+            creds = self.get_bigquery_credentials()
+        execution_project = self.execution_project
+        location = getattr(self, "location", None)
+
+        info = client_info.ClientInfo(user_agent=f"dbt-{dbt_version}")
+        return google.cloud.bigquery.Client(
+            execution_project,
+            creds,
+            location=location,
+            client_info=info,
+        )
 
 class BigQueryConnectionManager(BaseConnectionManager):
     TYPE = "bigquery"
@@ -232,6 +288,7 @@ class BigQueryConnectionManager(BaseConnectionManager):
 
     @classmethod
     def close(cls, connection):
+
         connection.state = ConnectionState.CLOSED
 
         return connection
@@ -265,89 +322,28 @@ class BigQueryConnectionManager(BaseConnectionManager):
         return f"{rows_number:3.1f}{unit}".strip()
 
     @classmethod
-    def get_bigquery_credentials(cls, profile_credentials):
-        method = profile_credentials.method
-        creds = GoogleServiceAccountCredentials.Credentials
-
-        if method == BigQueryConnectionMethod.OAUTH:
-            credentials, _ = get_bigquery_defaults(scopes=profile_credentials.scopes)
-            return credentials
-
-        elif method == BigQueryConnectionMethod.SERVICE_ACCOUNT:
-            keyfile = profile_credentials.keyfile
-            return creds.from_service_account_file(keyfile, scopes=profile_credentials.scopes)
-
-        elif method == BigQueryConnectionMethod.SERVICE_ACCOUNT_JSON:
-            details = profile_credentials.keyfile_json
-            return creds.from_service_account_info(details, scopes=profile_credentials.scopes)
-
-        elif method == BigQueryConnectionMethod.OAUTH_SECRETS:
-            return GoogleCredentials.Credentials(
-                token=profile_credentials.token,
-                refresh_token=profile_credentials.refresh_token,
-                client_id=profile_credentials.client_id,
-                client_secret=profile_credentials.client_secret,
-                token_uri=profile_credentials.token_uri,
-                scopes=profile_credentials.scopes,
-            )
-
-        error = 'Invalid `method` in profile: "{}"'.format(method)
-        raise FailedToConnectException(error)
-
-    @classmethod
-    def get_impersonated_bigquery_credentials(cls, profile_credentials):
-        source_credentials = cls.get_bigquery_credentials(profile_credentials)
-        return impersonated_credentials.Credentials(
-            source_credentials=source_credentials,
-            target_principal=profile_credentials.impersonate_service_account,
-            target_scopes=list(profile_credentials.scopes),
-            lifetime=(profile_credentials.job_execution_timeout_seconds or 300),
-        )
-
-    @classmethod
-    def get_bigquery_client(cls, profile_credentials):
-        if profile_credentials.impersonate_service_account:
-            creds = cls.get_impersonated_bigquery_credentials(profile_credentials)
-        else:
-            creds = cls.get_bigquery_credentials(profile_credentials)
-        execution_project = profile_credentials.execution_project
-        location = getattr(profile_credentials, "location", None)
-
-        info = client_info.ClientInfo(user_agent=f"dbt-{dbt_version}")
-        return google.cloud.bigquery.Client(
-            execution_project,
-            creds,
-            location=location,
-            client_info=info,
-        )
-
-    @classmethod
     def open(cls, connection):
         if connection.state == "open":
             logger.debug("Connection is already open, skipping open.")
             return connection
 
-        try:
-            handle = cls.get_bigquery_client(connection.credentials)
-
-        except google.auth.exceptions.DefaultCredentialsError:
+        def handle_default_credentials_error(*args):
             logger.info("Please log into GCP to continue")
             gcloud.setup_default_credentials()
 
-            handle = cls.get_bigquery_client(connection.credentials)
+        exception_handlers = {
+            google.auth.exceptions.DefaultCredentialsError: handle_default_credentials_error
+        }
 
-        except Exception as e:
-            logger.debug(
-                "Got an error when attempting to create a bigquery " "client: '{}'".format(e)
-            )
+        connection = cls.set_connection_handle(
+            connection,
+            logger=logger,
+            retry_limit=connection.credentials.connect_retries,
+            retry_all=connection.credentials.retry_all,
+            timeout=connection.credentials.retry_timeout,
+            exception_handlers=exception_handlers
+        )
 
-            connection.handle = None
-            connection.state = "fail"
-
-            raise FailedToConnectException(str(e))
-
-        connection.handle = handle
-        connection.state = "open"
         return connection
 
     @classmethod
